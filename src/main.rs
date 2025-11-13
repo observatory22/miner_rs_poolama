@@ -1,11 +1,42 @@
-use cudarc::driver::{CudaContext, DriverError, LaunchConfig, PushKernelArg};
+use blake3::hash;
+use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
 
 const PTX_SRC: &str = include_str!("miner.cu");
 
 use cudarc::nvrtc::CompileOptions;
 
+use base16::{decode, encode_lower};
 use blake3::platform::Platform;
+use hex;
 mod cpu_ref;
+
+const rig: &str = "rig";
+const wallet: &str = "62BjjEC1198HapgdMBC3VaA17CpjdKsSj5oCFpwWdCQe5cQxGoqHWwujWFWGTBBKd4";
+const secret: &str = "abc123";
+
+/// Calculate target from difficulty
+/// Target has `difficulty` binary 0s followed by 1s, total 256 bits
+fn calculate_target(difficulty: u8) -> [u8; 32] {
+    let mut target = [0xFFu8; 32]; // Start with all 1s
+    let full_zero_bytes = (difficulty / 8) as usize;
+    let remaining_bits = (difficulty % 8) as u32;
+
+    // Set full zero bytes
+    for i in 0..full_zero_bytes {
+        if i < 32 {
+            target[i] = 0;
+        }
+    }
+
+    // Handle partial byte
+    if full_zero_bytes < 32 && remaining_bits > 0 {
+        // Create mask with remaining_bits zeros at the beginning
+        let mask = (1u8 << (8 - remaining_bits)) - 1;
+        target[full_zero_bytes] &= mask;
+    }
+
+    target
+}
 
 /// Tiny hex (lowercase) helper without pulling a crate.
 fn hex_lower(data: &[u8]) -> String {
@@ -121,9 +152,84 @@ struct DevRun {
     head_host: u64,                                // we keep consumer head only on host
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn fetch_seed() -> Result<[u8; 241], Box<dyn std::error::Error>> {
+    let tag = format!("{}:{}:{}", rig, wallet, secret);
+    let b16encode = base16::encode_lower(tag.as_bytes());
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post("http://poolama.com/next_sol_seed")
+        .header("Tag", b16encode)
+        .header(reqwest::header::CONNECTION, "close")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()).into());
+    }
+
+    let seed_bytes = response.bytes().await?;
+    let mut seed_with_difficulty = [0u8; 241];
+    seed_with_difficulty.copy_from_slice(&seed_bytes);
+    Ok(seed_with_difficulty)
+}
+
+async fn submit_solution(buf: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let tag = format!("{}:{}:{}", rig, wallet, secret);
+    let b16encode = encode_lower(tag.as_bytes());
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post("http://poolama.com/submit_sol")
+        .header("Tag", b16encode)
+        .body(buf.to_vec())
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_body = response.text().await?;
+
+    println!("Submission status code: {}", status);
+    println!("Server response: {}", response_body);
+
+    if !status.is_success() {
+        return Err(format!(
+            "Submission failed with status {}: {}",
+            status, response_body
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------- host precompute ----------
-    let seed = [0u8; 240];
+    println!("Fetching seed from poolama.com...");
+    let seed_with_difficulty = fetch_seed().await?;
+    println!("Seed fetched successfully");
+
+    let difficulty = seed_with_difficulty[240];
+    let mut seed = [0u8; 240];
+    seed.copy_from_slice(&seed_with_difficulty[..240]);
+    println!("Difficulty: {}", difficulty);
+    print!("Seed: ");
+    println!(
+        "{}",
+        seed.iter()
+            .map(|byte| format!("{:02X}", byte))
+            .collect::<String>()
+    );
+    let target = calculate_target(difficulty);
+    print!("target: ");
+    println!(
+        "{}",
+        target
+            .iter()
+            .map(|byte| format!("{:02X}", byte))
+            .collect::<String>()
+    );
 
     // let start = std::time::Instant::now();
     // (Optional) keep your CPU matmul + hash preview
@@ -229,6 +335,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let local_start: u64 =
             <usize as TryInto<u64>>::try_into(dev_idx).unwrap() * 0x1000_00000000;
+        let local_start: u64 = ((seed[232] as u64) << 56)
+            + ((seed[233] as u64) << 48)
+            + ((seed[234] as u64) << 40)
+            + ((seed[235] as u64) << 32);
+        // let local_start: u64 = 0xFF << 56;
+        println!("local_start: {:016X}", local_start);
 
         let local_count = 0x7fffffff;
 
@@ -359,7 +471,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s1 = seed.clone();
 
                 // write nonce (u64) as little endian
-                let nonce_bytes = nonce.to_le_bytes();
+                // let nonce_bytes = nonce.to_le_bytes();
+                let nonce_bytes = nonce.to_be_bytes();
 
                 // replace bytes 232..240 with nonce_bytes
                 s1[232..240].copy_from_slice(&nonce_bytes);
@@ -372,14 +485,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let h = blake3::hash(&buf);
 
-                println!("[GPU {}] SOLUTION nonce=0x{:016x}", gpu, nonce);
-                println!("seed||matmul BLAKE3 = {}", h.to_hex());
+                // Compare with target difficulty
+                let hash_hex = h.to_hex();
+
+                // Compare hex strings lexicographically (since they're big-endian)
+                if h.as_bytes().clone() <= target {
+                    println!(
+                        "{}",
+                        buf.iter()
+                            .map(|byte| format!("{:02X}", byte))
+                            .collect::<String>()
+                    );
+                    println!("[GPU {}] VALID SOLUTION nonce=0x{:016x}", gpu, nonce);
+                    println!("seed||matmul BLAKE3 = {}", hash_hex);
+                    println!("Hash meets target difficulty!");
+                    // Submit solution to poolama.com
+                    println!("Submitting solution to poolama.com...");
+                    match submit_solution(&buf).await {
+                        Ok(_) => println!("Solution submitted successfully"),
+                        Err(e) => eprintln!("Failed to submit solution: {}", e),
+                    }
+                } else {
+                    println!("[GPU {}] INVALID SOLUTION nonce=0x{:016x}", gpu, nonce);
+                    // println!("Hash does NOT meet target difficulty");
+                    println!("seed||matmul BLAKE3 = {}", hash_hex);
+                }
             }
         }
 
-        if t0.elapsed() > poll_for {
-            break 'outer;
-        }
+        //run forever
+        // if t0.elapsed() > poll_for {
+        //     break 'outer;
+        // }
 
         // light sleep to avoid hogging CPU
         std::thread::sleep(std::time::Duration::from_millis(100));
